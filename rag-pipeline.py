@@ -174,4 +174,38 @@ class Pipeline:
 
     def pipes(self) -> List[Dict[str, str]]:
         # что увидит Open WebUI в списке моделей
-        return [{"id": self.pipeline
+        return [{"id": self.pipeline_id, "name": self.pipeline_name}]
+
+    def pipe(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            messages = body.get("messages") or []
+            question = _last_user_text(messages)
+
+            if not question:
+                return {"choices": [{"message": {"role": "assistant", "content": "Не вижу вопроса."}}]}
+
+            vec = ollama_embeddings(question)
+            hits = qdrant_search(vec)
+            context = build_context(hits)
+            answer = ollama_chat(question, context)
+
+            if DEBUG_RAG:
+                answer += "\n\n---\nDEBUG:\n" + _dumps(
+                    {
+                        "qdrant_url": QDRANT_URL,
+                        "collection": QDRANT_COLLECTION,
+                        "ollama_url": OLLAMA_URL,
+                        "embed_model": EMBED_MODEL,
+                        "llm_model": LLM_MODEL,
+                        "hits": len(hits),
+                    }
+                )
+
+            # Open WebUI ждёт OpenAI-like форму
+            return {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            if DEBUG_RAG:
+                msg += "\n" + traceback.format_exc()
+            return {"choices": [{"message": {"role": "assistant", "content": f"RAG pipeline error: {msg}"}}]}
