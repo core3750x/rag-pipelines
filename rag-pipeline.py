@@ -1,30 +1,15 @@
-# qdrant_rag_phi.py
-# Open WebUI Pipelines: Qdrant RAG -> Ollama (phi) using Ollama embeddings (nomic-embed-text)
-#
-# Env:
-#   QDRANT_URL            default: http://qdrant.qdrant.svc.cluster.local:6333
-#   QDRANT_COLLECTION     default: docs_pdf
-#   OLLAMA_URL            default: http://ollama.ollama.svc.cluster.local:11434
-#   EMBED_MODEL           default: nomic-embed-text:latest
-#   LLM_MODEL             default: phi:latest
-#   TOP_K                 default: 6
-#   MAX_CONTEXT_CHARS     default: 12000
-#   CONTEXT_STRATEGY      default: concat   (concat|xml)
-#   INCLUDE_SCORES        default: 1
-#   INCLUDE_SOURCES       default: 1
-#   REQUEST_TIMEOUT_SEC   default: 300
-#   DEBUG_RAG             default: 0
+# rag-pipeline.py
+# Open WebUI Pipelines (PIPE): Qdrant RAG -> Ollama (phi) with Ollama embeddings (nomic-embed-text)
 
 import os
 import json
-import time
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import requests
 
 
-def _env(name: str, default: str = "") -> str:
+def _env(name: str, default: str) -> str:
     v = os.environ.get(name)
     return default if v is None else str(v).strip()
 
@@ -36,33 +21,23 @@ OLLAMA_URL = _env("OLLAMA_URL", "http://ollama.ollama.svc.cluster.local:11434").
 EMBED_MODEL = _env("EMBED_MODEL", "nomic-embed-text:latest")
 LLM_MODEL = _env("LLM_MODEL", "phi:latest")
 
-TOP_K = int(_env("TOP_K", "6") or "6")
-MAX_CONTEXT_CHARS = int(_env("MAX_CONTEXT_CHARS", "12000") or "12000")
-
-CONTEXT_STRATEGY = (_env("CONTEXT_STRATEGY", "concat") or "concat").lower()
-INCLUDE_SCORES = (_env("INCLUDE_SCORES", "1") != "0")
-INCLUDE_SOURCES = (_env("INCLUDE_SOURCES", "1") != "0")
-
-REQUEST_TIMEOUT_SEC = int(_env("REQUEST_TIMEOUT_SEC", "300") or "300")
+TOP_K = int(_env("TOP_K", "6"))
+MAX_CONTEXT_CHARS = int(_env("MAX_CONTEXT_CHARS", "12000"))
 DEBUG_RAG = (_env("DEBUG_RAG", "0") == "1")
 
 
-def _json_dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+def _dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
 
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _pick_last_user_message(messages: List[Dict[str, Any]]) -> str:
+def _last_user_text(messages: List[Dict[str, Any]]) -> str:
     for m in reversed(messages or []):
         if (m.get("role") or "").lower() == "user":
             return (m.get("content") or "").strip()
     return ""
 
 
-def _extract_text_from_payload(payload: Any) -> str:
+def _extract_text(payload: Any) -> str:
     if isinstance(payload, dict):
         for k in ("text", "content", "chunk", "page_content", "body"):
             v = payload.get(k)
@@ -76,7 +51,6 @@ def _extract_text_from_payload(payload: Any) -> str:
                 if isinstance(v, str) and v.strip():
                     return v.strip()
 
-        # fallback: stringify payload
         try:
             return json.dumps(payload, ensure_ascii=False)
         except Exception:
@@ -88,7 +62,7 @@ def _extract_text_from_payload(payload: Any) -> str:
     return str(payload)
 
 
-def _extract_source_from_payload(payload: Any) -> str:
+def _extract_source(payload: Any) -> str:
     if not isinstance(payload, dict):
         return ""
     for k in ("source", "file", "path", "s3_key", "url", "title", "doc"):
@@ -104,12 +78,12 @@ def _extract_source_from_payload(payload: Any) -> str:
     return ""
 
 
-def ollama_embeddings(prompt: str) -> List[float]:
+def ollama_embeddings(text: str) -> List[float]:
     r = requests.post(
         f"{OLLAMA_URL}/api/embeddings",
         headers={"Content-Type": "application/json"},
-        data=_json_dumps({"model": EMBED_MODEL, "prompt": prompt}),
-        timeout=REQUEST_TIMEOUT_SEC,
+        data=_dumps({"model": EMBED_MODEL, "prompt": text}),
+        timeout=120,
     )
     r.raise_for_status()
     data = r.json()
@@ -120,17 +94,11 @@ def ollama_embeddings(prompt: str) -> List[float]:
 
 
 def qdrant_search(vector: List[float]) -> List[Dict[str, Any]]:
-    payload = {
-        "vector": vector,
-        "limit": TOP_K,
-        "with_payload": True,
-        "with_vectors": False,
-    }
     r = requests.post(
         f"{QDRANT_URL}/collections/{QDRANT_COLLECTION}/points/search",
         headers={"Content-Type": "application/json"},
-        data=_json_dumps(payload),
-        timeout=REQUEST_TIMEOUT_SEC,
+        data=_dumps({"vector": vector, "limit": TOP_K, "with_payload": True, "with_vectors": False}),
+        timeout=120,
     )
     r.raise_for_status()
     data = r.json()
@@ -138,41 +106,32 @@ def qdrant_search(vector: List[float]) -> List[Dict[str, Any]]:
     return res if isinstance(res, list) else []
 
 
-def _build_context(hits: List[Dict[str, Any]]) -> str:
+def build_context(hits: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     total = 0
 
     for i, h in enumerate(hits, start=1):
-        score = h.get("score")
         payload = h.get("payload", {})
-        text = _extract_text_from_payload(payload)
-        source = _extract_source_from_payload(payload)
+        txt = _extract_text(payload)
+        src = _extract_source(payload)
+        score = h.get("score")
 
-        head_bits: List[str] = [f"[{i}]"]
-        if INCLUDE_SCORES and score is not None:
-            head_bits.append(f"score={score}")
-        if INCLUDE_SOURCES and source:
-            head_bits.append(f"source={source}")
+        header = f"[{i}]"
+        if score is not None:
+            header += f" score={score}"
+        if src:
+            header += f" source={src}"
 
-        header = " ".join(head_bits)
-        block = f"{header}\n{text}\n"
-
+        block = f"{header}\n{txt}\n"
         if total + len(block) > MAX_CONTEXT_CHARS:
             break
-
         parts.append(block)
         total += len(block)
 
-    context = "\n---\n".join(parts).strip()
-
-    if CONTEXT_STRATEGY == "xml":
-        # useful for some models to parse better
-        return f"<context>\n{context}\n</context>" if context else "<context></context>"
-
-    return context
+    return "\n---\n".join(parts).strip()
 
 
-def ollama_chat_with_context(question: str, context: str) -> str:
+def ollama_chat(question: str, context: str) -> str:
     system = (
         "Ты отвечаешь строго по CONTEXT из внутренней документации.\n"
         "Если ответа в CONTEXT нет — честно скажи, что в документации это не найдено.\n"
@@ -184,7 +143,7 @@ def ollama_chat_with_context(question: str, context: str) -> str:
     r = requests.post(
         f"{OLLAMA_URL}/api/chat",
         headers={"Content-Type": "application/json"},
-        data=_json_dumps(
+        data=_dumps(
             {
                 "model": LLM_MODEL,
                 "stream": False,
@@ -194,7 +153,7 @@ def ollama_chat_with_context(question: str, context: str) -> str:
                 ],
             }
         ),
-        timeout=REQUEST_TIMEOUT_SEC,
+        timeout=300,
     )
     r.raise_for_status()
     data = r.json()
@@ -205,53 +164,14 @@ def ollama_chat_with_context(question: str, context: str) -> str:
 
 
 class Pipeline:
-    # This name is shown as a model/provider in Open WebUI when using Pipelines.
-    name = "docs_pdf (Qdrant) → phi (RAG)"
+    """
+    ВАЖНО: Это PIPE-пайплайн. Pipelines-сервис ожидает .pipe(...)
+    """
 
     def __init__(self) -> None:
-        pass
+        self.pipeline_id = "rag-pipeline"
+        self.pipeline_name = "docs_pdf (Qdrant) → phi (RAG)"
 
-    # OpenAI-compatible endpoint used by Pipelines service
-    def chat_completions(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        started = _now_ms()
-        try:
-            messages = body.get("messages") or []
-            question = _pick_last_user_message(messages)
-            if not question:
-                return {
-                    "id": "rag-empty",
-                    "object": "chat.completion",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "Не вижу вопроса."}}],
-                }
-
-            vec = ollama_embeddings(question)
-            hits = qdrant_search(vec)
-            context = _build_context(hits)
-            answer = ollama_chat_with_context(question, context)
-
-            if DEBUG_RAG:
-                debug_info = {
-                    "qdrant_hits": len(hits),
-                    "collection": QDRANT_COLLECTION,
-                    "embed_model": EMBED_MODEL,
-                    "llm_model": LLM_MODEL,
-                    "ms": _now_ms() - started,
-                }
-                answer = f"{answer}\n\n---\nDEBUG:\n{json.dumps(debug_info, ensure_ascii=False, indent=2)}"
-
-            return {
-                "id": "rag",
-                "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}}],
-            }
-
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-            if DEBUG_RAG:
-                err = err + "\n" + traceback.format_exc()
-
-            return {
-                "id": "rag-error",
-                "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": f"RAG pipeline error: {err}"}}],
-            }
+    def pipes(self) -> List[Dict[str, str]]:
+        # что увидит Open WebUI в списке моделей
+        return [{"id": self.pipeline
