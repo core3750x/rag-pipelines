@@ -1,33 +1,33 @@
 # rag-pipeline.py
 # Open WebUI Pipelines (PIPE): Qdrant RAG -> Ollama (LLM) + Ollama embeddings (nomic-embed-text)
-# - No hardcoded DevOps keyword heuristics
-# - Handles Open WebUI metadata tasks like title_generation locally (no LLM / no Qdrant)
-# - Prevents embedding requests from exceeding embedding model context by trimming input
+#
+# Key points:
+# - Supports OpenAI-compatible streaming (SSE) when Open WebUI sends stream=true
+# - Handles Open WebUI metadata task "title_generation" locally (no Qdrant, no LLM)
+# - Trims embedding input to avoid nomic context warnings (n_ctx_train=2048)
 #
 # Env vars expected:
 #   QDRANT_URL         (default: http://qdrant.qdrant.svc.cluster.local:6333)
 #   QDRANT_COLLECTION  (default: docs_pdf)
 #   OLLAMA_URL         (default: http://ollama.ollama.svc.cluster.local:11434)
 #   EMBED_MODEL        (default: nomic-embed-text:latest)
-#   LLM_MODEL          (default: qwen3:1.7b)
+#   LLM_MODEL          (default: qwen3:1.7b)   # поменяй на то, что реально есть в ollama
 #   TOP_K              (default: 3)
-#   MAX_CONTEXT_CHARS  (default: 5000)
-#   EMBED_MAX_CHARS    (default: 2000)   # to avoid nomic num_ctx>n_ctx_train issues
-#   DEBUG_RAG          (default: 0)       # 1 adds debug footer and stack traces in errors
+#   MAX_CONTEXT_CHARS  (default: 6000)
+#   EMBED_MAX_CHARS    (default: 1800)
+#   DEBUG_RAG          (default: 0)            # 1 => добавляет debug и трейсбек в ошибки
 
 import os
 import re
 import json
 import time
+import uuid
 import traceback
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
 def _env(name: str, default: str) -> str:
     v = os.environ.get(name)
     return default if v is None else str(v).strip()
@@ -40,20 +40,32 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False)
-
-
 def _clean_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+def _safe_truncate(s: str, max_chars: int) -> str:
+    s = _clean_ws(s)
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    return s[:max_chars]
+
+
+def _dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _sse(data: Any) -> str:
+    # OpenAI streaming expects SSE lines: "data: {...}\n\n"
+    return f"data: {_dumps(data)}\n\n"
+
+
 def _extract_prompt_from_titlegen_blob(text: str) -> str:
-    # Open WebUI title_generation format contains "Prompt: <original>"
-    m = re.search(r"Prompt:\s*(.+)\s*$", text, flags=re.IGNORECASE | re.DOTALL)
+    # Open WebUI title_generation: "... Prompt: <original>"
+    m = re.search(r"Prompt:\s*(.+)\s*$", text or "", flags=re.IGNORECASE | re.DOTALL)
     if m:
         return _clean_ws(m.group(1))
-    return _clean_ws(text)
+    return _clean_ws(text or "")
 
 
 def _last_user_text(messages: List[Dict[str, Any]]) -> str:
@@ -77,9 +89,18 @@ def _get_task(kwargs: Dict[str, Any]) -> str:
     return ""
 
 
+def _get_stream_flag(kwargs: Dict[str, Any]) -> bool:
+    # Open WebUI usually sends stream=true
+    if isinstance(kwargs.get("stream"), bool):
+        return bool(kwargs.get("stream"))
+    body = kwargs.get("body")
+    if isinstance(body, dict) and isinstance(body.get("stream"), bool):
+        return bool(body.get("stream"))
+    return False
+
+
 def _extract_question(kwargs: Dict[str, Any]) -> str:
-    # Pipelines may call pipe() with different payload shapes depending on Open WebUI version.
-    # Try common places:
+    # Different Open WebUI versions call pipe with different shapes
     um = kwargs.get("user_message")
     if isinstance(um, str) and um.strip():
         return um.strip()
@@ -91,7 +112,6 @@ def _extract_question(kwargs: Dict[str, Any]) -> str:
             q = _last_user_text(msgs)
             if q:
                 return q
-        # sometimes prompt is here
         pr = body.get("prompt")
         if isinstance(pr, str) and pr.strip():
             return pr.strip()
@@ -110,28 +130,17 @@ def _extract_question(kwargs: Dict[str, Any]) -> str:
 
 
 def _make_title(prompt_blob: str) -> str:
-    # No heuristics; just extract and compress to 3-5 "words"
     prompt = _extract_prompt_from_titlegen_blob(prompt_blob)
     words = re.findall(r"[A-Za-zА-Яа-я0-9]+(?:-[A-Za-zА-Яа-я0-9]+)*", prompt)
-    title = " ".join(words[:5]).strip()
-    if not title:
+    base = " ".join(words[:5]).strip()
+    if not base:
         return "💬 Новый чат"
-    # capitalize first char safely
-    title = title[0].upper() + title[1:]
-    return f"💬 {title}"
-
-
-def _safe_truncate(s: str, max_chars: int) -> str:
-    s = _clean_ws(s)
-    if max_chars <= 0:
-        return s
-    if len(s) <= max_chars:
-        return s
-    return s[:max_chars]
+    base = base[0].upper() + base[1:]
+    return f"💬 {base}"
 
 
 def _extract_text_from_payload(payload: Any) -> str:
-    # Try a few common keys produced by different ingesters
+    # Try common keys produced by different ingesters
     if isinstance(payload, dict):
         for k in ("text", "content", "chunk", "page_content", "body"):
             v = payload.get(k)
@@ -139,10 +148,9 @@ def _extract_text_from_payload(payload: Any) -> str:
                 return v.strip()
         md = payload.get("metadata")
         if isinstance(md, dict):
-            for k in ("text", "content", "chunk", "page_content", "body", "source", "path", "title"):
+            for k in ("text", "content", "chunk", "page_content", "body"):
                 v = md.get(k)
                 if isinstance(v, str) and v.strip():
-                    # metadata is not always the chunk text; but if text isn't elsewhere, it can help
                     return v.strip()
     if isinstance(payload, str) and payload.strip():
         return payload.strip()
@@ -160,17 +168,16 @@ EMBED_MODEL = _env("EMBED_MODEL", "nomic-embed-text:latest")
 LLM_MODEL = _env("LLM_MODEL", "qwen3:1.7b")
 
 TOP_K = _env_int("TOP_K", 3)
-MAX_CONTEXT_CHARS = _env_int("MAX_CONTEXT_CHARS", 5000)
-EMBED_MAX_CHARS = _env_int("EMBED_MAX_CHARS", 2000)
+MAX_CONTEXT_CHARS = _env_int("MAX_CONTEXT_CHARS", 6000)
+EMBED_MAX_CHARS = _env_int("EMBED_MAX_CHARS", 1800)
 
 DEBUG_RAG = (_env("DEBUG_RAG", "0") == "1")
 
 
 # -----------------------------
-# Ollama + Qdrant calls
+# Qdrant + Ollama
 # -----------------------------
 def ollama_embeddings(text: str) -> List[float]:
-    # embeddings must be computed only from the question, trimmed
     text = _extract_prompt_from_titlegen_blob(text)
     text = _safe_truncate(text, EMBED_MAX_CHARS)
 
@@ -210,21 +217,21 @@ def qdrant_search(vector: List[float], limit: int) -> List[Dict[str, Any]]:
 def build_context(hits: List[Dict[str, Any]], max_chars: int) -> str:
     parts: List[str] = []
     total = 0
+
     for h in hits or []:
         payload = h.get("payload", {})
         txt = _extract_text_from_payload(payload)
         if not txt:
             continue
-
         txt = _clean_ws(txt)
         if not txt:
             continue
 
         block = txt + "\n"
         if total + len(block) > max_chars:
-            remaining = max_chars - total
-            if remaining > 50:
-                parts.append(block[:remaining])
+            rem = max_chars - total
+            if rem > 50:
+                parts.append(block[:rem])
             break
 
         parts.append(block)
@@ -235,7 +242,6 @@ def build_context(hits: List[Dict[str, Any]], max_chars: int) -> str:
 
 
 def ollama_chat_ru(question: str, context: str) -> str:
-    # Force RU output. If model can’t, it may still respond EN, but qwen3 should.
     system = (
         "Ты помощник по внутренней документации.\n"
         "Всегда отвечай на русском.\n"
@@ -271,6 +277,63 @@ def ollama_chat_ru(question: str, context: str) -> str:
 
 
 # -----------------------------
+# OpenAI-compatible response builders
+# -----------------------------
+def _openai_final(model: str, content: str) -> Dict[str, Any]:
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+def _openai_stream_chunks(model: str, content: str) -> Iterable[str]:
+    # Split into small chunks to look "live"
+    chunk_size = 120
+    created = int(time.time())
+    chat_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    # First chunk can be empty delta (some clients like it)
+    first = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    yield _sse(first)
+
+    for i in range(0, len(content), chunk_size):
+        piece = content[i : i + chunk_size]
+        chunk = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}],
+        }
+        yield _sse(chunk)
+
+    last = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+    yield _sse(last)
+    yield "data: [DONE]\n\n"
+
+
+# -----------------------------
 # Pipeline class (required by Open WebUI Pipelines)
 # -----------------------------
 class Pipeline:
@@ -281,29 +344,34 @@ class Pipeline:
     def pipes(self) -> List[Dict[str, str]]:
         return [{"id": self.pipeline_id, "name": self.pipeline_name}]
 
-    def pipe(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    def pipe(self, *args: Any, **kwargs: Any) -> Any:
         started = time.time()
         try:
             task = _get_task(kwargs)
+            stream = _get_stream_flag(kwargs)
             raw_q = _extract_question(kwargs)
 
-            # 1) Handle Open WebUI title generation without LLM/Qdrant
+            # 1) Title generation (metadata task) — local answer, no LLM/Qdrant
             if task == "title_generation":
                 title = _make_title(raw_q)
-                return {"choices": [{"message": {"role": "assistant", "content": title}}]}
+                # For title_generation Open WebUI expects non-stream
+                return _openai_final(self.pipeline_id, title)
 
-            # 2) Normal RAG flow
+            # 2) RAG
             question = _extract_prompt_from_titlegen_blob(raw_q)
             if not question:
-                return {"choices": [{"message": {"role": "assistant", "content": "Не вижу вопроса."}}]}
+                out = "Не вижу вопроса."
+                return _openai_stream_chunks(self.pipeline_id, out) if stream else _openai_final(self.pipeline_id, out)
 
             vec = ollama_embeddings(question)
             hits = qdrant_search(vec, TOP_K)
             context = build_context(hits, MAX_CONTEXT_CHARS)
 
-            # If nothing found, answer gracefully
             if not context:
-                answer = "В документации не нашёл. Уточни, в каком именно месте/системе это настраивается (например: values helm-чарта, connection в Airflow, переменные окружения, Kubernetes Secret и т.д.)."
+                answer = (
+                    "В документации не нашёл.\n"
+                    "Подскажи: это про Airflow Helm values, про connection в UI, или про переменные окружения в pod?"
+                )
             else:
                 answer = ollama_chat_ru(question, context)
 
@@ -322,10 +390,13 @@ class Pipeline:
                     }
                 )
 
-            return {"choices": [{"message": {"role": "assistant", "content": answer}}]}
+            return _openai_stream_chunks(self.pipeline_id, answer) if stream else _openai_final(self.pipeline_id, answer)
 
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             if DEBUG_RAG:
                 msg += "\n" + traceback.format_exc()
-            return {"choices": [{"message": {"role": "assistant", "content": f"RAG pipeline error: {msg}"}}]}
+            out = f"RAG pipeline error: {msg}"
+            # Even on errors, respect stream flag so UI doesn’t ломается
+            stream = _get_stream_flag(kwargs)
+            return _openai_stream_chunks(self.pipeline_id, out) if stream else _openai_final(self.pipeline_id, out)
