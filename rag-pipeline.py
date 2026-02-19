@@ -1,10 +1,15 @@
 # rag-pipeline.py
 # Open WebUI Pipelines (PIPE): Qdrant RAG -> Ollama (phi) with Ollama embeddings (nomic-embed-text)
+#
+# Works with pipelines that call:
+#   Pipeline.pipe(user_message="...", **kwargs)
+# and also with OpenAI-like body:
+#   Pipeline.pipe(body={"messages":[...]}, **kwargs)
 
 import os
 import json
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -163,9 +168,42 @@ def ollama_chat(question: str, context: str) -> str:
     return content.strip()
 
 
+def _extract_question_from_kwargs(kwargs: Dict[str, Any]) -> str:
+    # Newer pipelines call: pipe(user_message="...", ...)
+    um = kwargs.get("user_message")
+    if isinstance(um, str) and um.strip():
+        return um.strip()
+
+    # Sometimes: body={"messages":[...]}
+    body = kwargs.get("body")
+    if isinstance(body, dict):
+        msgs = body.get("messages")
+        if isinstance(msgs, list):
+            q = _last_user_text(msgs)
+            if q:
+                return q
+
+    # Sometimes directly: messages=[...]
+    msgs = kwargs.get("messages")
+    if isinstance(msgs, list):
+        q = _last_user_text(msgs)
+        if q:
+            return q
+
+    # Or a plain prompt
+    prompt = kwargs.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+
+    return ""
+
+
 class Pipeline:
     """
-    ВАЖНО: Это PIPE-пайплайн. Pipelines-сервис ожидает .pipe(...)
+    PIPE pipeline for Open WebUI Pipelines.
+    Must provide:
+      - pipes() -> list of models
+      - pipe(...) -> handles generation
     """
 
     def __init__(self) -> None:
@@ -173,14 +211,12 @@ class Pipeline:
         self.pipeline_name = "docs_pdf (Qdrant) → phi (RAG)"
 
     def pipes(self) -> List[Dict[str, str]]:
-        # что увидит Open WebUI в списке моделей
         return [{"id": self.pipeline_id, "name": self.pipeline_name}]
 
-    def pipe(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    # NOTE: accept anything; pipelines service passes user_message=...
+    def pipe(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         try:
-            messages = body.get("messages") or []
-            question = _last_user_text(messages)
-
+            question = _extract_question_from_kwargs(kwargs)
             if not question:
                 return {"choices": [{"message": {"role": "assistant", "content": "Не вижу вопроса."}}]}
 
@@ -192,16 +228,13 @@ class Pipeline:
             if DEBUG_RAG:
                 answer += "\n\n---\nDEBUG:\n" + _dumps(
                     {
-                        "qdrant_url": QDRANT_URL,
                         "collection": QDRANT_COLLECTION,
-                        "ollama_url": OLLAMA_URL,
+                        "hits": len(hits),
                         "embed_model": EMBED_MODEL,
                         "llm_model": LLM_MODEL,
-                        "hits": len(hits),
                     }
                 )
 
-            # Open WebUI ждёт OpenAI-like форму
             return {"choices": [{"message": {"role": "assistant", "content": answer}}]}
 
         except Exception as e:
